@@ -218,89 +218,119 @@ def grouper(n, iterable):
         if not chunk:
             return
         yield chunk
-        
-"""  Make optimizer routine"""
-def make_optimizer(args, net):
-    trainable = filter(lambda x: x.requires_grad, net.parameters()) # Only the parameters that requires gradient are passed to the optimizer
 
-    #kwargs['lr'] = args['lr']
-    #kwargs['weight_decay'] = args['weight_decay']
+def make_optimizer(args, model):
+    """
+    Create an optimizer
+    """
+    if args is None:
+        return None
 
-    if args['optimizer'] == 'SGD':
-        optimizer_function = optim.SGD
-        kwargs = {
-            'momentum': 0.9,
-            'nesterov': True
-        }
-    elif args['optimizer'] == 'ADAM':
-        optimizer_function = optim.Adam
-        kwargs = {
-            'betas': (args['beta1'], args['beta2']),
-            'eps': args['epsilon'],
-            'weight_decay': args['weight_decay']
-        }
-    elif args['optimizer'] == 'ADAMW':
-        optimizer_function = optim.AdamW
-        kwargs = {
-            'lr': args['lr'],
-            'betas': (args['beta1'], args['beta2']),
-            'eps': args['epsilon'],
-            'weight_decay': args['weight_decay']
-        }
-    elif args['optimizer'] == 'RADAM':
-        optimizer_function = optim.RAdam
-        kwargs = {
-            'betas': (args['beta1'], args['beta2']),
-            'eps': args['epsilon'],
-            'weight_decay': args['weight_decay'],
-            'decoupled_weight_decay': True
-        }
-    elif args['optimizer'] == 'NADAM':
-        optimizer_function = torch.optim.NAdam
-        kwargs = {
-            'betas': (args['beta1'], args['beta2']),
-            'eps': args['epsilon'],
-            'momentum_decay': 4e-3,
-            'weight_decay': args['weight_decay'],
-            'decoupled_weight_decay': False
-        }
-    elif args['optimizer'] == 'RMSprop':
-        optimizer_function = optim.RMSprop
-        kwargs = {'eps': args['epsilon']}
+    optimizer_type = args.get('optimizer', 'ADAM').upper()
+    lr = args.get('lr', 1e-3)
+    weight_decay = args.get('weight_decay', 0.0)
     
-    return optimizer_function(trainable, **kwargs)
-
-
-
-""" Make scheduler routine """
-def make_scheduler(args, optimizer):
-    if args['type'] == 'multi':
-        scheduler = lrs.MultiStepLR(
-            optimizer,
-            milestones=args['milestones'],
-            gamma=args['gamma']
+    if optimizer_type == 'ADAMW':
+        print(f"   ⚡ Optimizer: AdamW(lr={lr}, weight_decay={weight_decay})")
+        return optim.AdamW(
+            model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+            betas=(args.get('beta1', 0.9), args.get('beta2', 0.999)),
+            eps=args.get('epsilon', 1e-8)
         )
-    elif args['type'] == 'CLR':
-        scheduler = lrs.CyclicLR(optimizer, base_lr = 1e-5, max_lr = 1e-2)
-    elif args['type'] == 'Plateau':
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    elif optimizer_type == 'ADAM':
+        print(f"   ⚡ Optimizer: Adam(lr={lr}, weight_decay={weight_decay})")
+        return optim.Adam(
+            model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+            betas=(args.get('beta1', 0.9), args.get('beta2', 0.999))
+        )
+    elif optimizer_type == 'SGD':
+        print(f"   ⚡ Optimizer: SGD(lr={lr}, weight_decay={weight_decay})")
+        return optim.SGD(
+            model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+            momentum=args.get('momentum', 0.9)
+        )
+    else:
+        print(f"⚠️  Optimizer '{optimizer_type}' não reconhecido. Usando AdamW padrão.")
+        return optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        
+
+def make_scheduler(args, optimizer):
+    """
+    Create a learning rate scheduler - VERSÃO CORRIGIDA
+    """
+    if args is None:
+        return None
+
+    scheduler_type = args.get('type', '').upper()
+    
+    print(f"🔧 Criando scheduler: {scheduler_type}")
+    
+    if scheduler_type == 'COSINEANNEALING':
+        # Configuração do artigo LULC-SegNet
+        T_max = args.get('T_max', 25)
+        eta_min = args.get('eta_min', 0)
+        
+        print(f"   📈 Scheduler: CosineAnnealingLR(T_max={T_max}, eta_min={eta_min})")
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, 
+            T_max=T_max, 
+            eta_min=eta_min
+        )
+    
+    elif scheduler_type == 'MULTI' or scheduler_type == 'MULTISTEP':
+        # Scheduler MultiStep existente
+        milestones = args.get('milestones', [25, 35, 45])
+        gamma = args.get('gamma', 0.1)
+        print(f"   📈 Scheduler: MultiStepLR(milestones={milestones}, gamma={gamma})")
+        return lrs.MultiStepLR(
+            optimizer,
+            milestones=milestones,
+            gamma=gamma
+        )
+        
+    elif scheduler_type == 'CLR':
+        # Scheduler CyclicLR existente
+        print("   📈 Scheduler: CyclicLR")
+        return lrs.CyclicLR(optimizer, base_lr=1e-5, max_lr=1e-2)
+        
+    elif scheduler_type == 'PLATEAU':
+        # Scheduler ReduceLROnPlateau existente
+        print("   📈 Scheduler: ReduceLROnPlateau")
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='max',             
             factor=0.5,              
             patience=3,             
-            #threshold=1e-4,          
-            #threshold_mode='rel',   
-            cooldown=3,              # evita reduções seguidas
-            min_lr=1e-6,             # mínimo aceitável
+            cooldown=3,
+            min_lr=1e-6,
             verbose=True
         )
-    else:
-        scheduler = lrs.StepLR(
+        
+    elif scheduler_type == 'STEP':
+        # Scheduler StepLR existente
+        step_size = args.get('step_size', args.get('lr_decay', 30))  # Fallback para lr_decay
+        gamma = args.get('gamma', 0.1)
+        print(f"   📈 Scheduler: StepLR(step_size={step_size}, gamma={gamma})")
+        return lrs.StepLR(
             optimizer,
-            step_size=args['lr_decay'],
-            gamma=args['gamma']
+            step_size=step_size,
+            gamma=gamma
         )
-    return scheduler
+        
+    else:
+        # Fallback para CosineAnnealing padrão
+        print(f"⚠️  Scheduler '{scheduler_type}' não reconhecido. Usando CosineAnnealing padrão.")
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, 
+            T_max=25, 
+            eta_min=0
+        )
 
 
 def calculate_cm(predictions, labels, label_values = None, normalize = None):

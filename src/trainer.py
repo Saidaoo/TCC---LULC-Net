@@ -21,6 +21,7 @@ from sklearn.metrics import confusion_matrix
 import math
 from torchmetrics import Accuracy, F1Score, MatthewsCorrCoef, JaccardIndex
 from typing import Optional, Sequence
+
 # --- Utilitário para ativar dropout em inferência (MC Dropout) sem ativar BatchNorm updates ---
 def enable_mc_dropout(model: nn.Module):
     """Mantém model em eval(), mas ativa apenas camadas Dropout para MC samples.
@@ -34,6 +35,61 @@ def enable_mc_dropout(model: nn.Module):
         if isinstance(m, (nn.Dropout, nn.Dropout2d, nn.Dropout3d)):
             m.train()
         # mantém BatchNorm em eval() explicitamente — já está em eval() pelo model.eval()
+
+
+class MixedLoss(nn.Module):
+    """
+    Mixed Loss do artigo LULC-SegNet: Combinação ponderada de 
+    Focal Loss + Dice Loss + Cross Entropy Loss
+    """
+    def __init__(self, w1=0.3, w2=0.3, w3=0.4, alpha=None, gamma=2.0, num_classes=8, 
+                 ignore_index=-100):
+        super().__init__()
+        self.w1, self.w2, self.w3 = w1, w2, w3
+        self.num_classes = num_classes
+        self.ignore_index = ignore_index
+        
+        # Inicializar as losses individuais
+        # CORREÇÃO: FocalLoss sem reduction
+        self.focal_loss = FocalLoss(
+            mode='multiclass', 
+            alpha=alpha, 
+            gamma=gamma,
+            ignore_index=ignore_index
+        )
+        
+        # CORREÇÃO: DiceLoss sem reduction
+        self.dice_loss = DiceLoss(
+            mode='multiclass',
+            classes=num_classes,
+            log_loss=False,
+            from_logits=True,
+            ignore_index=ignore_index
+        )
+        
+        # CORREÇÃO: CrossEntropy sem reduction
+        self.ce_loss = nn.CrossEntropyLoss(
+            ignore_index=ignore_index,
+            reduction='mean'  # Apenas CE precisa de reduction
+        )
+        
+    def forward(self, outputs, targets):
+        """
+        Args:
+            outputs: Logits da rede [B, C, H, W]
+            targets: Ground truth [B, H, W]
+        Returns:
+            Mixed loss value
+        """
+        # Calcular cada loss individualmente
+        focal_l = self.focal_loss(outputs, targets)
+        dice_l = self.dice_loss(outputs, targets)
+        ce_l = self.ce_loss(outputs, targets)
+        
+        # Combinação ponderada conforme artigo
+        mixed_loss = self.w1 * focal_l + self.w2 * dice_l + self.w3 * ce_l
+        
+        return mixed_loss
 
 
 class F1Accumulator:
@@ -259,120 +315,6 @@ def uncertainty_in_calm_zone(
     #plt.imsave('vis_output/calm_mask.png', img, cmap='gray')
     return calm_mask
 
-class CRFasRNN_Fixed(nn.Module):
-    def __init__(self, num_classes, num_iterations=10,
-                 gaussian_ksize=5, gaussian_sigma=0.5,
-                 bilateral_ksize=5, bilateral_sigma_color=0.5, bilateral_sigma_space=5.0,
-                 edge_ksize=5, edge_sigma_color=0.5, edge_sigma_space=5.0):
-                 
-        
-        """
-        CRF as RNN sem parâmetros aprendíveis.
-        - num_classes: número de classes C.
-        - num_iterations: iterações de refinamento.
-        - Parâmetros de filtro fixos (tamanho e sigma).
-        """
-        super().__init__()
-        self.num_classes = num_classes
-        self.num_iterations = num_iterations
-
-        # --- Filtro Gaussiano Espacial fixo ---
-        # Criar kernel Gaussiano 2D (Gaussian blur) de dimensão gaussian_ksize.
-        # Usamos padding = ksize//2 para manter o tamanho.
-        # O kernel é o mesmo para todos os canais, aplicável via conv2d com groups=num_classes.
-        '''
-        grid = torch.arange(gaussian_ksize) - (gaussian_ksize - 1) / 2
-        x, y = torch.meshgrid(grid, grid, indexing='ij')
-        gaussian_kernel = torch.exp(-(x**2 + y**2) / (2 * gaussian_sigma**2))
-        gaussian_kernel /= gaussian_kernel.sum()
-        # Inicializa conv separada para cada canal
-        kernel = gaussian_kernel.view(1, 1, gaussian_ksize, gaussian_ksize)
-        self.register_buffer('gaussian_kernel', kernel)  # formato [1,1,k,k]
-        '''
-        # --- Filtro Gaussiano Espacial via Kornia ---
-        # Cria o módulo GaussianBlur2d que aplica depth‑wise blur em q ([B,C,H,W])
-        self.gaussian_blur = KF.GaussianBlur2d(
-            kernel_size=(gaussian_ksize, gaussian_ksize),
-            sigma=(gaussian_sigma, gaussian_sigma),
-            border_type='reflect',
-            separable=True
-        )
-
-        # --- Matrizes de Compatibilidade fixas (1x1 conv) ---
-        # Usamos o modelo de Potts: 0 na diagonal, -1 nas off-diagonais.
-        compat = -torch.ones((num_classes, num_classes))
-        compat.fill_diagonal_(0)
-        
-        # Formatar para conv2d 1x1: [C_out, C_in, 1, 1]
-        self.register_buffer('compat_spatial', compat.view(num_classes, num_classes, 1, 1))
-        self.register_buffer('compat_rgb', compat.view(num_classes, num_classes, 1, 1))
-        self.register_buffer('compat_edge', compat.view(num_classes, num_classes, 1, 1))
-        self.register_buffer('bilateral_sigma_color', torch.tensor(bilateral_sigma_color))
-        self.register_buffer('bilateral_sigma_space', torch.tensor(bilateral_sigma_space))
-        self.register_buffer('edge_sigma_color',     torch.tensor(edge_sigma_color))
-        self.register_buffer('edge_sigma_space',     torch.tensor(edge_sigma_space))
-        self.bilateral_ksize = bilateral_ksize
-        self.edge_ksize = edge_ksize
-
-    def forward(self, unary_logits, image, edges):
-        """
-        unary_logits: Tensor [B, C, H, W] com logit de cada classe.
-        image: Tensor [B, 3, H, W] da imagem (supõe-range [0,1]).
-        Retorna mapa de probabilidades refinado [B, C, H, W].
-        """
-        B, C, H, W = unary_logits.shape
-        q = F.softmax(unary_logits, dim=1)  # [B, C, H, W]
-        #print(f"q_softmax.mean={q.mean()}, q_softmax.std={q.std()}")#2.440253496170044
-        
-        edges = edges.unsqueeze(1)#.expand(-1, C, -1, -1)
-        
-        sigma_color_rgb  = self.bilateral_sigma_color .view(1).expand(B)
-        sigma_color_edge = self.edge_sigma_color      .view(1).expand(B)
-        sigma_space_rgb  = self.bilateral_sigma_space.view(1, 1).expand(B, 2)
-        sigma_space_edge = self.edge_sigma_space    .view(1, 1).expand(B, 2)
-        
-        #gaussian_weight = self.gaussian_kernel.repeat(C, 1, 1, 1)
-        #pad_g = self.gaussian_kernel.size(2) // 2
-        
-        for _ in range(self.num_iterations):
-            spatial_filtered = self.gaussian_blur(q) 
-            rgb_filtered = kornia.filters.joint_bilateral_blur(
-                q, image, (self.bilateral_ksize, self.bilateral_ksize),
-                sigma_color=sigma_color_rgb, sigma_space=sigma_space_rgb,
-                color_distance_type='l1', border_type='reflect',
-            )
-            edge_filtered = kornia.filters.joint_bilateral_blur(
-                q, edges, (self.edge_ksize, self.edge_ksize),
-                sigma_color=sigma_color_edge, sigma_space=sigma_space_edge,
-                color_distance_type='l1', border_type='reflect',
-            )
-            pairwise_spatial = F.conv2d(spatial_filtered, self.compat_spatial)
-            pairwise_rgb     = F.conv2d(rgb_filtered,     self.compat_rgb)
-            pairwise_edge    = F.conv2d(edge_filtered,    self.compat_edge)
-            
-            #w_spatial = 0.8
-            #w_rgb = 0.8  
-            #w_edge = 0.8
-            #pairwise = w_spatial * pairwise_spatial + w_rgb * pairwise_rgb + w_edge * pairwise_edge
-            pairwise = 1.0*(pairwise_spatial + pairwise_rgb + pairwise_edge)#
-            #print(f"pairwise.mean={pairwise.mean()}, pairwise.std={pairwise.std()}")
-            
-            q = F.softmax(unary_logits - pairwise, dim=1)
-            #print(f"q_pairwise.mean={q.mean()}, q_pairwise.std={q.std()}")
-        
-        '''
-        print(f"edge_filtered.shape={edge_filtered.shape}")
-        img = spatial_filtered[0, 0].detach().cpu().numpy() 
-        plt.imsave('vis_output/spatial_0.png', img, cmap='gray')
-        img = rgb_filtered[0, 0].detach().cpu().numpy() 
-        plt.imsave('vis_output/rgb_0.png', img, cmap='gray')
-        img = edge_filtered[0, 0].detach().cpu().numpy() 
-        plt.imsave('vis_output/edges_0.png', img, cmap='gray')
-        '''
-
-        return q
-
-
 # Paleta de cores da segmentação
 palette = {
     0: (255, 0, 0),
@@ -439,141 +381,6 @@ def gaussian_kernel(kernel_size: int, sigma: float, device):
     return kernel / kernel.sum()
 
 
-class CRFasRNN(nn.Module):
-    def __init__(
-        self,
-        num_classes: int,
-        num_iterations: int = 10,
-        gaussian_ks: int = 5,
-        gaussian_sigma: float = 0.1,# 5.0, 0.5, 0.05, 0.005
-        # bilateral RGB
-        bilateral_ks: int = 5,
-        bilateral_spatial_sigma: float = 5.0,
-        bilateral_color_sigma: float = 0.1, # 1.0 0.1, 0.01, 0.001,
-        # bilateral Edge
-        edge_ks: int = 5,
-        edge_spatial_sigma: float = 5.0,
-        edge_intensity_sigma: float = 0.1,
-    ):
-        super().__init__()
-        self.num_classes = num_classes
-        self.num_iterations = num_iterations
-
-        self.gaussian_ks = gaussian_ks
-        self.gaussian_sigma = gaussian_sigma
-
-        self.bilateral_ks = bilateral_ks
-        self.bilateral_spatial_sigma = bilateral_spatial_sigma
-        self.bilateral_color_sigma = bilateral_color_sigma
-
-        self.edge_ks = edge_ks
-        self.edge_spatial_sigma = edge_spatial_sigma
-        self.edge_intensity_sigma = edge_intensity_sigma
-
-        # compatibilidade aprendível C×C no modo Potts
-        kappa = 1.0  # fator de penalização; ajuste conforme necessidade
-        init = -kappa * torch.eye(num_classes, num_classes, device=self.device)
-        self.compat_mat = nn.Parameter(init)
-
-    def forward(self, logits: torch.Tensor, img: torch.Tensor, gt_edges: torch.Tensor):
-        """
-        logits:   [B, C, H, W]
-        img:      [B, 3, H, W]   — RGB normalizado em [0,1]
-        gt_edges: [B,  H, W]     — mapa binário/probabilístico de bordas
-
-        Note: q é inicializado fora do loop para representar a distribuição unária inicial
-        e então iterativamente refinado dentro do loop de mean‑field.
-        """
-        B, C, H, W = logits.shape
-
-        q = F.softmax(logits, dim=1)  # [B,C,H,W]
-
-        # pré‑cria kernels no device
-        gk = gaussian_kernel(self.gaussian_ks, self.gaussian_sigma, self.device) \
-            .view(1, 1, self.gaussian_ks, self.gaussian_ks)
-        pad_g = self.gaussian_ks // 2
-        pad_b = self.bilateral_ks // 2
-        
-        K2 = self.bilateral_ks ** 2
-        spatial_w = gaussian_kernel(
-        self.bilateral_ks, self.bilateral_spatial_sigma, self.device
-        ).contiguous().view(1, 1, K2, 1)
-
-        ek = gaussian_kernel(self.edge_ks, self.edge_spatial_sigma, self.device) \
-            .view(1, 1, self.edge_ks, self.edge_ks)
-        pad_e = self.edge_ks // 2
-
-        for it in range(self.num_iterations):
-            # 1) Gaussian spatial
-            spatial = F.conv2d(q.reshape(B * C, 1, H, W), gk, padding=pad_g)
-            spatial = spatial.reshape(B, C, H, W)
-
-            # 2) Bilateral RGB (unfold)
-            q_unf = F.unfold(q, kernel_size=self.bilateral_ks, padding=pad_b)
-            img_unf = F.unfold(img, kernel_size=self.bilateral_ks, padding=pad_b)
-            _, _, L = q_unf.shape
-
-            q_unf = q_unf.view(B, C, K2, L)
-            img_unf = img_unf.view(B, 3, K2, L)
-            center = img.unsqueeze(2).contiguous().view(B, 3, 1, H * W)
-            diff = img_unf - center
-            color_w = torch.exp(-(diff**2).sum(1, keepdim=True) /
-                                (2 * self.bilateral_color_sigma**2))
-            w = spatial_w * color_w
-            bilateral_rgb = (q_unf * w).sum(2).contiguous().view(B, C, H, W)
-
-            # 3) Bilateral Edge
-            e_map = gt_edges.unsqueeze(1)  # [B,1,H,W]
-            e_feat = F.conv2d(e_map, ek, padding=pad_e)  # [B,1,H,W]
-            bilateral_edge = q * e_feat  # broadcast em C
-
-            pairwise = 1.0 * (spatial + bilateral_rgb)# + bilateral_edge
-            pairwise = torch.einsum('ij,bjpq->bipq', self.compat_mat, pairwise)
-
-            q = F.softmax(logits - pairwise, dim=1)
-
-        # salvar visualizações
-        '''
-        out_spatial = spatial[0, 0].detach().cpu().numpy()
-        plt.imsave('vis_output/spatial.png', out_spatial, cmap='gray')
-        out_rgb = bilateral_rgb[0, 0].detach().cpu().numpy()
-        plt.imsave('vis_output/rgb.png', out_rgb, cmap='gray')
-        out_edges = bilateral_edge[0, 0].detach().cpu().numpy()
-        plt.imsave('vis_output/edges.png', out_edges, cmap='gray')
-        '''
-
-        return q
-
-def kl_divergence_gpu(
-    outputs: torch.Tensor,
-    crf_outputs: torch.Tensor,
-    reduction: str = "mean"
-) -> torch.Tensor:
-    
-    #print(f"outputs.max() = {outputs.max()}")
-    outputs = F.log_softmax(outputs, dim=1)
-    #print(f"outputs.max() = {outputs.max()}")
-    crf_outputs = crf_outputs.clamp(min=1e-8)
-    
-    kl_loss = F.kl_div(outputs, crf_outputs, reduction=reduction)
-    #print(f"kl_loss.shape = {kl_loss.shape}")
-    kl_loss = kl_loss.sum(dim=1)
-    #print(f"kl_loss.shape = {kl_loss.shape}")
-    #kl_loss = kl_loss.mean()
-    #print(f"kl_loss = {kl_loss}")
-    '''
-    # supondo que `outputs` já seja softmax (p) e `crf_outputs` continue sendo softmax (q)
-    log_q = torch.log(crf_outputs)           # log q_{ij,c}
-    p = outputs.softmax(dim=1)               # p_{ij,c}
-    
-    kl_loss = F.kl_div(log_q, p, reduction='none')
-    # = p * (log p − log q) → D_KL(P||Q) por pixel
-    kl_loss = kl_loss.sum(dim=1)#.mean()
-    '''
-    return kl_loss
-
-
-
 class Trainer():
     
     def __init__(self, net, loader, params, scheduler = True, cbkp = None,):
@@ -582,6 +389,11 @@ class Trainer():
         self.loader = loader
         self.params = params
         self.iter_ = 0
+        
+        # DEBUG: Verificar parâmetros recebidos
+        print("🔍 DEBUG no Trainer:")
+        print(f"   Tem lrs_params: {'lrs_params' in self.params}")
+        print(f"   lrs_params recebido: {self.params.get('lrs_params', 'NÃO ENCONTRADO')}")
         
         self.width = 224
         self.height = 224
@@ -604,28 +416,17 @@ class Trainer():
         self.mean_losses = np.zeros(100000000)
         self.print_each = params['print_each'] or 100 
         
-        # # Weights for class balancing
-        #self.weight_cls = self.prepare([self.params['weights']])
-        self.CE = nn.CrossEntropyLoss(reduce=None, reduction="none")#, weight=self.weight_cls[0]
-        self.FL = FocalLoss(mode='multiclass', alpha=self.params['loss']['params']['alpha'], gamma=self.params['loss']['params']['gamma'], reduction='none')
-        self.DI = DiceLoss(
-            mode='multiclass',
-            classes=8,  # ou lista de índices de classes a considerar
-            log_loss=False,
-            from_logits=True,  # True se sua rede não aplica softmax na saída
-        )
-        self.JL = JaccardLoss(
-            mode='multiclass',
-            classes=8,  # ou lista de índices de classes a considerar
-            log_loss=False,
-            from_logits=True,  # True se sua rede não aplica softmax na saída
-        )
-        self.TV = TverskyLoss(
-            mode='multiclass',
-            classes=8,  # ou lista de índices de classes a considerar
-            log_loss=False,
-            from_logits=True,  # True se sua rede não aplica softmax na saída
-            alpha=1.0, beta=0.5
+        # Configurar Mixed Loss conforme artigo LULC-SegNet
+        loss_params = self.params.get('loss', {})
+        loss_params_params = loss_params.get('params', {})
+        
+        self.mixed_loss = MixedLoss(
+            w1=0.3,
+            w2=0.3, 
+            w3=0.4,
+            alpha=loss_params_params.get('alpha', None),
+            gamma=loss_params_params.get('gamma', 2.0),
+            num_classes=self.params['n_classes']
         )
         
         # Define an id to a trained model. Use the number of seconds since 1970
@@ -1141,18 +942,14 @@ class Trainer():
             self.optimizer.zero_grad()
             outputs = self.net(inputs)              # [B,C,H,W]
             
-            probs = F.softmax(outputs, dim=1)
-            
-            #loss = self.FL(probs, labels).mean()
+            # USAR MIXED LOSS - muito mais simples!
             labels = labels.long()
-            #loss = self.CE(outputs, labels).mean()
-            #loss = self.DI(outputs, labels).mean()
-            #loss = self.JL(outputs, labels).mean()
-            loss = self.TV(outputs, labels)#.mean()
+            loss = self.mixed_loss(outputs, labels)
             
             loss.backward()
             self.optimizer.step()
             
+            probs = F.softmax(outputs, dim=1)
             max_values, armax = torch.max(probs.data, 1)
             
             acc_metric.update(armax, labels)

@@ -188,27 +188,26 @@ class Callback():
 
 
 def weights_calculator_loss(params, train_labels):
+    """
+    Calcula os pesos das classes para a função de loss - VERSÃO SIMPLIFICADA
+    """
     try:
-        if params['loss']['name'] == LossFN.CROSS_ENTROPY:
-            if params['loss']['params']['weights'] == 'equal':
-                params['weights'] = torch.ones(params['n_classes'])
-            elif params['loss']['params']['weights'] == 'calculate':
-                if os.path.exists('./loss_weights.npy'):
-                    loss_weights = load_loss_weights('./loss_weights.npy')
-                    params['weights'] = torch.from_numpy(loss_weights['weights']).float()
-                else:
-                    import utils.weights_calculator as wc
-                    loss_weights, _ = wc.WeightsCalculator(train_labels, params['classes'], dev=False).calculate_and_save()
-                    params['weights'] = torch.from_numpy(loss_weights).float()
-        elif params['loss']['name'] == LossFN.FOCAL_LOSS:
-            params['weights'] = torch.ones(params['n_classes'])
-
-        print("🎯 Pesos das classes para loss:")
-        for i, (cls, weight) in enumerate(zip(params['classes'], params['weights'])):
-            print(f"   {cls}: {weight:.4f}")
+        print("🎯 Configurando pesos das classes para loss...")
+        
+        # Para Mixed Loss, usar pesos uniformes (o imbalanceamento é tratado pela própria loss)
+        weights = [1.0] * params['n_classes']
+        
+        print("   ✅ Usando pesos uniformes (Mixed Loss já lida com imbalanceamento via Focal + Dice)")
+        print("   📋 Distribuição de pesos:")
+        for i, cls_name in enumerate(params['classes']):
+            print(f"   {i}: {cls_name} - peso: 1.0000")
+            
+        return torch.tensor(weights, dtype=torch.float32)
+        
     except Exception as e:
-        print(f"❌ Erro ao calcular pesos: {e}")
-        raise e
+        print(f"❌ Erro inesperado: {e}")
+        print("   🛟 Usando pesos uniformes como fallback")
+        return torch.ones(params['n_classes'], dtype=torch.float32)
 
 def print_training_summary(params, train_loader, val_loader, test_loader):
     """Debug completo do setup de treinamento"""
@@ -266,6 +265,7 @@ if __name__=='__main__':
         'bs': 40,
         'n_classes': 8,
         'classes': ["Urbano", "Vegetação Densa", "Sombra", "Vegetação Esparsa", "Agricultura", "Rocha", "Solo Exposto", "Água"],
+        'weights': 'calculate',
         'maximum_epochs': 999,
         'save_epoch': 2,
         'print_each': 100,
@@ -273,34 +273,81 @@ if __name__=='__main__':
         'cpu': None,
         'device': 'cuda',
         'precision': 'full',
+    
+        # **OTIMIZADOR - Atualizado conforme artigo**
         'optimizer_params': {
             'optimizer': 'ADAMW',
-            'lr': 1e-3,
+            'lr': 3.5e-3,  # Learning rate do artigo LULC-SegNet
             'beta1': 0.9,
             'beta2': 0.999,
-            'weight_decay': 0.001,
+            'weight_decay': 1e-2,  # Weight decay do artigo
             'epsilon': 1e-8
         },
+        # Citação: Página 11-12, Seção "Experimental Details"
+        # """
+        # "We chose the AdamW optimizer (initial learning rate = 3.5 × 10⁻³, 
+        # weight_decay = 1 × 10⁻², and cps = 1 × 10⁻⁸) and used the cosine 
+        # annealing optimization scheduler (T_max = 25 and eta_min = 0)."
+        # """
+    
+        # **SCHEDULER - Atualizado conforme artigo**
         'lrs_params': {
-            'type': 'Plateau',
-            'lr_decay': 30,
-            'milestones': [25, 35, 45],
-            'gamma': 0.1
+            'type': 'CosineAnnealing',  # Cosine annealing mencionado no artigo
+            'T_max': 25,  # T_max do artigo
+            'eta_min': 0,  # eta_min do artigo
+            # Remover Plateau se usar CosineAnnealing
+            # 'lr_decay': 30,
+            # 'milestones': [25, 35, 45],
+            # 'gamma': 0.1
         },
-        'weights': '',
+        # Citação: Página 12, Seção "Experimental Details"
+        # """
+        # "We chose the AdamW optimizer... and used the cosine annealing 
+        # optimization scheduler (T_max = 25 and eta_min = 0)."
+        # """
+    
+        # **LOSS - Atualizado para Mixed Loss do artigo**
         'loss': {
-            'name': LossFN.TVERSKY,
+            'name': 'mixed',  # Nova loss implementada
             'params': {
-                'weights': 'calculate',
-                'alpha': 0.5,
-                'gamma': 2.0,
+                'alpha': 0.25,  # Para Focal Loss (ajuste conforme suas classes)
+                'gamma': 2.0,   # Para Focal Loss
+                # Os pesos (0.3, 0.3, 0.4) estão hardcoded na classe MixedLoss
             }
         },
+        # Citação: Página 10-11, Seção "Hybridization Loss Function"
+        # """
+        # "We employ a multiple loss function weighted average approach as a loss...
+        # We perform hyperparameter-weighted averaging of the focal loss, dice loss, 
+        # and cross entropy loss to alleviate the category imbalance problem in the 
+        # LULC segmentation networks, as follows:
+
+        # Mixed Loss = W₁ × FocalLoss + W₂ × DiceLoss + W₃ × CELoss
+
+        # where W₁, W₂, and W₃ are the weight parameters for mixed loss...
+        # Increasing the weight of the cross-entropy loss is generally believed to 
+        # effectively alleviate the training difficulties introduced by Dice loss 
+        # and the parameter sensitivity drawbacks of the Focal loss."
+        # """
+        # Referências: [48], [49], [51], [63], [64]
+
+        # Citação: Página 10-11, Seção "Hybridization Loss Function"
+        # """
+        # "In imbalanced samples, introducing Focal loss and Dice loss can mitigate 
+        # the class imbalance issue; however, it significantly increases the difficulty 
+        # of network training. Therefore, assigning equal weights should be avoided 
+        # when setting the weight parameters for a combined loss function."
+        # """
+        # Referências: [49], [60], [61], [62]
+    
         'patience': 10,
         'model': {
             'name': ModelChooser.LULC_NET,
         },
-        'results_folder': "../output/LULC_NET_experiment",
+        'results_folder': "../output/LULC_NET_experiment_mixed_loss",
+    
+        # **NOVO PARÂMETRO - Estratégia de dados do artigo**
+        'stride': 32,  # Para validação/teste com sliding window
     }
     
     params['results_folder'] = f"../output/LULC_NET_{params['model']['name']}_imgnet_{params['optimizer_params']['optimizer']}{params['optimizer_params']['weight_decay']}WD_{params['loss']['name']}1.0-0.5_noWeight"
@@ -427,6 +474,12 @@ if __name__=='__main__':
     print_training_summary(params, train_loader, val_loader, test_loader)
 
     cbkp = None
+    # DEBUG: Verificar se lrs_params existe
+    print("🔍 DEBUG - Verificando parâmetros:")
+    print(f"   Tem lrs_params: {'lrs_params' in params}")
+    print(f"   lrs_params: {params.get('lrs_params', 'NÃO ENCONTRADO')}")
+    print(f"   Todos as chaves: {list(params.keys())}")
+
     trainer = Trainer(model, loader, params, cbkp=cbkp)
     # clear()
 
