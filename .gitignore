@@ -2,7 +2,7 @@
 # ============================================
 # APENAS A PASTA DE IMAGENS DO DATASET
 # ============================================
-dataset_35/images/
+dataset_35/images/*.tif
 
 # ============================================
 # CACHE DO PYTHON (OPCIONAL MAS RECOMENDADO)
