@@ -1,6 +1,7 @@
 from skimage import io
 import os, time
 import torch
+import torch.nn as nn
 import numpy as np
 import pandas as pd
 from project_utils import load_loss_weights
@@ -273,13 +274,12 @@ if __name__=='__main__':
         'device': 'cuda',
         'precision': 'full',
         'optimizer_params': {
-            'optimizer': 'ADAM',
+            'optimizer': 'ADAMW',
             'lr': 1e-3,
             'beta1': 0.9,
             'beta2': 0.999,
-            'weight_decay': 0,
-            'epsilon': 1e-8,
-            'momentum': 0.9
+            'weight_decay': 0.001,
+            'epsilon': 1e-8
         },
         'lrs_params': {
             'type': 'Plateau',
@@ -367,10 +367,55 @@ if __name__=='__main__':
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=params['bs'], shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=params['bs'], shuffle=False)
 
+    #Debug do Otimizador
     # Build model
     print("🧠 Construindo modelo LULC-Net...")
     model = build_lulc_model(params)
     print(f"✅ Modelo {params['model']['name']} criado com sucesso!")
+
+    # ======== ADICIONE AQUI O DEBUG DO BATCHNORM ========
+    print("\n🔍 ANALISANDO ARQUITETURA DO MODELO...")
+    print("=" * 60)
+
+    # Contar e listar camadas BatchNorm
+    batch_norm_count = 0
+    batch_norm_layers = []
+
+    for name, module in model.named_modules():
+        if isinstance(module, nn.BatchNorm2d):
+            batch_norm_count += 1
+            batch_norm_layers.append(name)
+            if batch_norm_count <= 8:  # Mostra apenas os primeiros 8
+                print(f"   ✅ BatchNorm: {name}")
+
+    print(f"\n📊 RESUMO DA ARQUITETURA:")
+    print(f"   • Total de camadas BatchNorm: {batch_norm_count}")
+    print(f"   • Modelo tem BatchNorm: {'SIM' if batch_norm_count > 0 else 'NÃO'}")
+
+    # Ajuste automático baseado na arquitetura
+    if batch_norm_count > 0:
+        print("🎯 RECOMENDAÇÃO: Modelo COM BatchNorm → Usando AdamW com weight_decay = 0.001")
+        # Garante que está usando AdamW
+        params['optimizer_params']['optimizer'] = 'ADAMW'
+        params['optimizer_params']['weight_decay'] = 0.001
+    else:
+        print("🎯 RECOMENDAÇÃO: Modelo SEM BatchNorm → Usando AdamW com weight_decay = 0.01") 
+        params['optimizer_params']['optimizer'] = 'ADAMW'
+        params['optimizer_params']['weight_decay'] = 0.01
+
+    print(f"⚙️ Configuração final do otimizador:")
+    print(f"   • Otimizador: {params['optimizer_params']['optimizer']}")
+    print(f"   • Learning Rate: {params['optimizer_params']['lr']}")
+    print(f"   • Weight Decay: {params['optimizer_params']['weight_decay']}")
+    print("=" * 60 + "\n")
+    # ======== FIM DO DEBUG ========
+
+    loader = {
+        "train": train_loader,
+        "test": test_loader,
+        "val": val_loader,
+    }
+
 
     loader = {
         "train": train_loader,
@@ -383,7 +428,7 @@ if __name__=='__main__':
 
     cbkp = None
     trainer = Trainer(model, loader, params, cbkp=cbkp)
-    clear()
+    # clear()
 
     patCB = Callback(patience=params['patience'], min_value=60)
 
